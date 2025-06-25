@@ -1,30 +1,52 @@
-name: Deploy to EC2
+name: Auto Deploy to EC2
 
 on:
   push:
-    branches:
-      - main
+    branches: [ "main" ]
+    paths-ignore:
+      - 'README.md'
+      - '**.md'
+      - '.gitignore'
+      - '.github/**'
+
+env:
+  DEPLOY_DIR: /usr/share/nginx/html
+  EC2_HOST: ${{ secrets.EC2_HOST }}
+  EC2_USER: ${{ secrets.EC2_USER }}
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
-      # Step 1: Checkout code
-      - name: Checkout Repository
+      # ========== SETUP ========== #
+      - name: Checkout code
         uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
 
-      # Step 2: Set up .scpignore to exclude unnecessary files
-      - name: Create .scpignore
+      - name: Debug event info
         run: |
-          echo ".git" >> .scpignore
-          echo ".github" >> .scpignore
-          echo ".vscode" >> .scpignore
-          echo "*.md" >> .scpignore
-          echo "*.env" >> .scpignore
+          echo "=== Trigger Information ==="
+          echo "Event: ${{ github.event_name }}"
+          echo "Ref: ${{ github.ref }}"
+          echo "SHA: ${{ github.sha }}"
+          echo "Actor: ${{ github.actor }}"
+          echo "Workflow: ${{ github.workflow }}"
+          echo "=========================="
 
-      # Step 3: Validate required secrets
-      - name: Validate Environment Variables
+      # ========== SSH SETUP ========== #
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+          echo "SSH configuration complete"
+
+      # ========== PRE-DEPLOYMENT CHECKS ========== #
+      - name: Validate secrets
         run: |
           if [ -z "${{ secrets.EC2_HOST }}" ]; then
             echo "::error::EC2_HOST secret is missing"
@@ -38,62 +60,66 @@ jobs:
             echo "::error::EC2_SSH_KEY secret is missing"
             exit 1
           fi
+          echo "All secrets are present"
 
-      # Step 4: Clean remote directory
-      - name: Clean Remote Directory
-        uses: appleboy/ssh-action@master
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_KEY }}
-          script: |
-            echo "Cleaning deployment directory..."
-            sudo mkdir -p /usr/share/nginx/html
-            sudo chown -R $USER:$USER /usr/share/nginx/html
-            sudo chmod -R 755 /usr/share/nginx/html
-            if [ "$(ls -A /usr/share/nginx/html)" ]; then
-              sudo rm -rf /usr/share/nginx/html/{*,.*} || true
-            fi
-
-      # Step 5: Deploy files via SCP
-      - name: Deploy Files
-        uses: appleboy/scp-action@master
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_KEY }}
-          source: "."
-          target: "/usr/share/nginx/html"
-          recursive: true
-          overwrite: true
-          strip_components: 0
-
-      # Step 6: Configure Nginx and permissions
-      - name: Configure Server
-        uses: appleboy/ssh-action@master
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_KEY }}
-          script: |
-            # Set proper permissions
-            sudo chown -R www-data:www-data /usr/share/nginx/html
-            sudo chmod -R 755 /usr/share/nginx/html
-            
-            # Ensure there's an index file
-            if [ ! -f "/usr/share/nginx/html/index.html" ]; then
-              echo "<h1>Deployment Successful</h1><p>$(date)</p>" | sudo tee /usr/share/nginx/html/index.html
-            fi
-            
-            # Test and reload Nginx
-            sudo nginx -t
-            sudo systemctl restart nginx
-            sudo systemctl status nginx
-
-      # Step 7: Verify deployment
-      - name: Verify Deployment
+      # ========== SERVER PREPARATION ========== #
+      - name: Prepare server directory
         run: |
-          echo "Waiting 5 seconds for Nginx to restart..."
+          ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+          echo "=== Starting server preparation ==="
+          sudo mkdir -p $DEPLOY_DIR
+          sudo chown -R $USER:$USER $DEPLOY_DIR
+          sudo chmod -R 755 $DEPLOY_DIR
+          if [ "$(ls -A $DEPLOY_DIR)" ]; then
+            echo "Cleaning existing files..."
+            sudo rm -rf $DEPLOY_DIR/{*,.*} || true
+          fi
+          echo "=== Server ready for deployment ==="
+          EOF
+
+      # ========== DEPLOYMENT ========== #
+      - name: Sync files (rsync)
+        run: |
+          echo "Starting file sync..."
+          rsync -avz --delete \
+            -e "ssh -o StrictHostKeyChecking=no" \
+            --exclude '.git' \
+            --exclude '.github' \
+            --exclude '.vscode' \
+            --exclude '*.md' \
+            --exclude '*.env*' \
+            ./ ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:$DEPLOY_DIR/
+          echo "File sync completed"
+
+      # ========== POST-DEPLOYMENT ========== #
+      - name: Finalize deployment
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+          echo "=== Finalizing deployment ==="
+          sudo chown -R www-data:www-data $DEPLOY_DIR
+          sudo find $DEPLOY_DIR -type d -exec chmod 755 {} \;
+          sudo find $DEPLOY_DIR -type f -exec chmod 644 {} \;
+          
+          # Create default index if missing
+          if [ ! -f "$DEPLOY_DIR/index.html" ]; then
+            echo "<h1>Deployment Successful</h1><p>$(date)</p>" | sudo tee $DEPLOY_DIR/index.html
+          fi
+          
+          # Restart nginx
+          sudo nginx -t && sudo systemctl restart nginx
+          echo "=== Deployment complete ==="
+          EOF
+
+      # ========== VERIFICATION ========== #
+      - name: Verify deployment
+        run: |
+          echo "Waiting for Nginx to restart..."
           sleep 5
           echo "Testing endpoint..."
-          curl -sSf http://${{ secrets.EC2_HOST }} || (echo "::error::Website not responding"; exit 1)
+          curl -sSf http://${{ secrets.EC2_HOST }} || exit 1
+          echo "Deployment verified successfully"
+
+      - name: Completion notice
+        run: |
+          echo "🚀 Deployment workflow completed successfully!"
+          echo "View your site at: http://${{ secrets.EC2_HOST }}"
