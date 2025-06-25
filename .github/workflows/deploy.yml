@@ -1,0 +1,43 @@
+name: Simple EC2 Deployment
+
+on:
+  push:
+    branches: [ "main" ]
+
+env:
+  DEPLOY_PATH: /usr/share/nginx/html
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set Up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Clean EC2 Deploy Folder
+        run: |
+          ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "sudo rm -rf $DEPLOY_PATH/*"
+
+      - name: Deploy with rsync
+        run: |
+          rsync -avz --delete \
+            -e "ssh" \
+            --exclude='.git' \
+            --exclude='.github' \
+            ./ ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:$DEPLOY_PATH/
+
+      - name: Restart Nginx
+        run: |
+          ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "sudo systemctl restart nginx"
+
+      - name: Confirm Deployment
+        run: |
+          curl -sSf http://${{ secrets.EC2_HOST }}
